@@ -1039,19 +1039,22 @@ class Torrent:
         if diff:
             session_id = self.rpcserver.get_session_id()
             if session_id in self.prev_status:
+                prev_status = self.prev_status[session_id]
+
+                if any(key not in prev_status for key in status_dict):
+                    prev_status.update(status_dict)
+                    return status_dict
+
                 # We have a previous status dict, so lets make a diff
                 status_diff = {}
                 for key, value in status_dict.items():
-                    if key in self.prev_status[session_id]:
-                        if value != self.prev_status[session_id][key]:
-                            status_diff[key] = value
-                    else:
+                    if value != prev_status[key]:
                         status_diff[key] = value
 
-                self.prev_status[session_id] = status_dict
+                prev_status.update(status_dict)
                 return status_diff
 
-            self.prev_status[session_id] = status_dict
+            self.prev_status[session_id] = dict(status_dict)
             return status_dict
 
         return status_dict
