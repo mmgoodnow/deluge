@@ -8,7 +8,7 @@
 import logging
 from time import time
 
-from twisted.internet.defer import maybeDeferred, succeed
+from twisted.internet.defer import DeferredList, maybeDeferred, succeed
 
 import deluge.component as component
 from deluge.ui.client import client
@@ -127,13 +127,36 @@ class SessionProxy(component.Component):
 
         """
         if torrent_id in self.torrents:
+            if not keys and not self.torrents[torrent_id][1]:
+                d = client.core.get_torrent_status(torrent_id, [], False)
+
+                def on_status(result, torrent_id):
+                    t = time()
+                    try:
+                        self.torrents[torrent_id][0] = t
+                        self.torrents[torrent_id][1].update(result)
+                        for key in result:
+                            self.cache_times[torrent_id][key] = t
+                        return self.create_status_dict([torrent_id], keys)[torrent_id]
+                    except KeyError:
+                        log.debug(
+                            f'Status missing for torrent (removed?): {torrent_id}'
+                        )
+                        return {}
+
+                return d.addCallback(on_status, torrent_id)
+
             # Keep track of keys we need to request from the core
             keys_to_get = []
+            fetch_diff = True
             if not keys:
                 keys = list(self.torrents[torrent_id][1])
 
             for key in keys:
-                if (
+                if key not in self.torrents[torrent_id][1]:
+                    fetch_diff = False
+                    keys_to_get.append(key)
+                elif (
                     time() - self.cache_times[torrent_id].get(key, 0.0)
                     > self.cache_time
                 ):
@@ -141,7 +164,9 @@ class SessionProxy(component.Component):
             if not keys_to_get:
                 return succeed(self.create_status_dict([torrent_id], keys)[torrent_id])
             else:
-                d = client.core.get_torrent_status(torrent_id, keys_to_get, True)
+                d = client.core.get_torrent_status(
+                    torrent_id, keys_to_get, fetch_diff
+                )
 
                 def on_status(result, torrent_id):
                     t = time()
@@ -192,8 +217,7 @@ class SessionProxy(component.Component):
         """
 
         # Helper functions and callbacks ---------------------------------------
-        def on_status(result, torrent_ids, keys):
-            # Update the internal torrent status dict with the update values
+        def update_cache(result):
             t = time()
             for key, value in result.items():
                 try:
@@ -204,64 +228,100 @@ class SessionProxy(component.Component):
                 except KeyError:
                     # The torrent was removed
                     continue
+            return result
 
-            # Create the status dict
-            if not torrent_ids:
-                torrent_ids = list(result)
-
-            return self.create_status_dict(torrent_ids, keys)
-
-        def find_torrents_to_fetch(torrent_ids):
-            to_fetch = []
+        def fetch_cached_status(torrent_ids):
+            full_fetch = []
+            diff_fetch = []
             t = time()
+
             for torrent_id in torrent_ids:
                 torrent = self.torrents[torrent_id]
-                if t - torrent[0] > self.cache_time:
-                    to_fetch.append(torrent_id)
+                if not keys:
+                    if not torrent[1]:
+                        full_fetch.append(torrent_id)
+                        continue
+                    requested_keys = list(torrent[1])
                 else:
-                    # We need to check if a key is expired
-                    for key in keys:
-                        if (
-                            t - self.cache_times[torrent_id].get(key, 0.0)
-                            > self.cache_time
-                        ):
-                            to_fetch.append(torrent_id)
-                            break
+                    requested_keys = keys
 
-            return to_fetch
+                needs_fetch = False
+                needs_full_fetch = False
+                for key in requested_keys:
+                    if key not in torrent[1]:
+                        needs_fetch = True
+                        needs_full_fetch = True
+                    elif t - self.cache_times[torrent_id].get(key, 0.0) > self.cache_time:
+                        needs_fetch = True
 
-        # -----------------------------------------------------------------------
+                if needs_fetch:
+                    if needs_full_fetch:
+                        full_fetch.append(torrent_id)
+                    else:
+                        diff_fetch.append(torrent_id)
+
+            deferreds = []
+            if full_fetch:
+                d = client.core.get_torrents_status({'id': full_fetch}, keys, False)
+                d.addCallback(update_cache)
+                deferreds.append(d)
+
+            if diff_fetch:
+                d = client.core.get_torrents_status({'id': diff_fetch}, keys, True)
+                d.addCallback(update_cache)
+                deferreds.append(d)
+
+            if deferreds:
+                return DeferredList(deferreds).addCallback(
+                    lambda _: self.create_status_dict(torrent_ids, keys)
+                )
+
+            return maybeDeferred(self.create_status_dict, torrent_ids, keys)
 
         if not filter_dict:
             # This means we want all the torrents status
             # We get a list of any torrent_ids with expired status dicts
             torrents_list = list(self.torrents)
-            to_fetch = find_torrents_to_fetch(torrents_list)
-            if to_fetch:
-                d = client.core.get_torrents_status({'id': to_fetch}, keys, True)
-                return d.addCallback(on_status, torrents_list, keys)
-
-            # Don't need to fetch anything
-            return maybeDeferred(self.create_status_dict, torrents_list, keys)
+            return fetch_cached_status(torrents_list)
 
         if len(filter_dict) == 1 and 'id' in filter_dict:
             # At this point we should have a filter with just "id" in it
-            to_fetch = find_torrents_to_fetch(filter_dict['id'])
-            if to_fetch:
-                d = client.core.get_torrents_status({'id': to_fetch}, keys, True)
-                return d.addCallback(on_status, filter_dict['id'], keys)
-            else:
-                # Don't need to fetch anything, so just return data from the cache
-                return maybeDeferred(self.create_status_dict, filter_dict['id'], keys)
+            return fetch_cached_status(filter_dict['id'])
         else:
             # This is a keyworded filter so lets just pass it onto the core
             # XXX: Add more caching here.
             d = client.core.get_torrents_status(filter_dict, keys, True)
-            return d.addCallback(on_status, None, keys)
+
+            def on_status(result):
+                update_cache(result)
+                torrent_ids = list(result)
+                missing_torrent_ids = []
+
+                for torrent_id in torrent_ids:
+                    if not keys:
+                        if not self.torrents[torrent_id][1]:
+                            missing_torrent_ids.append(torrent_id)
+                    elif any(
+                        key not in self.torrents[torrent_id][1] for key in keys
+                    ):
+                        missing_torrent_ids.append(torrent_id)
+
+                if not missing_torrent_ids:
+                    return self.create_status_dict(torrent_ids, keys)
+
+                missing_status = client.core.get_torrents_status(
+                    {'id': missing_torrent_ids}, keys, False
+                )
+                missing_status.addCallback(update_cache)
+                return missing_status.addCallback(
+                    lambda _: self.create_status_dict(torrent_ids, keys)
+                )
+
+            return d.addCallback(on_status)
 
     def on_torrent_state_changed(self, torrent_id, state):
         if torrent_id in self.torrents:
-            self.torrents[torrent_id][1].setdefault('state', state)
+            self.torrents[torrent_id][1]['state'] = state
             self.cache_times.setdefault(torrent_id, {}).update(state=time())
 
     def on_torrent_added(self, torrent_id, from_state):
